@@ -9,6 +9,7 @@ import (
 type Config struct {
 	MailSource     string
 	IMAPAddr       string
+	OWABaseURL     string
 	User           string
 	Pass           string
 	APIToken       string
@@ -20,9 +21,12 @@ type Config struct {
 // сервис с пустым API_TOKEN означал бы открытый наружу доступ к чужой почте,
 // и тихий дефолт здесь опаснее отказа подниматься.
 func Load(getenv func(string) string) (*Config, error) {
+	// Дефолт — owa: для аккаунтов МЭИ IMAP и EWS выключены администраторами
+	// (993 обрывает TLS, EWS отвечает 403), рабочим остаётся только веб-OWA.
 	c := &Config{
-		MailSource: or(getenv("MAIL_SOURCE"), "imap"),
+		MailSource: or(getenv("MAIL_SOURCE"), "owa"),
 		IMAPAddr:   or(getenv("IMAP_ADDR"), "mail.mpei.ru:993"),
+		OWABaseURL: or(getenv("OWA_BASE_URL"), "https://mail.mpei.ru"),
 		User:       getenv("MPEI_USER"),
 		Pass:       getenv("MPEI_PASS"),
 		APIToken:   getenv("API_TOKEN"),
@@ -37,8 +41,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		}
 	}
 
-	if c.MailSource != "imap" {
-		return nil, fmt.Errorf("MAIL_SOURCE=%q не поддерживается, доступно: imap", c.MailSource)
+	if c.MailSource != "imap" && c.MailSource != "owa" {
+		return nil, fmt.Errorf("MAIL_SOURCE=%q не поддерживается, доступно: imap, owa", c.MailSource)
 	}
 
 	d, err := time.ParseDuration(or(getenv("REQUEST_TIMEOUT"), "30s"))

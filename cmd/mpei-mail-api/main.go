@@ -14,7 +14,9 @@ import (
 
 	"github.com/gyattalert/mpei-mail-api/internal/config"
 	"github.com/gyattalert/mpei-mail-api/internal/httpapi"
+	"github.com/gyattalert/mpei-mail-api/internal/mail"
 	"github.com/gyattalert/mpei-mail-api/internal/mail/imapsrc"
+	"github.com/gyattalert/mpei-mail-api/internal/mail/owasrc"
 )
 
 const shutdownGrace = 10 * time.Second
@@ -30,7 +32,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	src := imapsrc.New(cfg.IMAPAddr, cfg.User, cfg.Pass)
+	var src mail.Source
+	var upstream string
+	switch cfg.MailSource {
+	case "owa":
+		src = owasrc.New(cfg.OWABaseURL, cfg.User, cfg.Pass)
+		upstream = cfg.OWABaseURL
+	default:
+		src = imapsrc.New(cfg.IMAPAddr, cfg.User, cfg.Pass)
+		upstream = cfg.IMAPAddr
+	}
 	handler := withTimeout(httpapi.New(src, cfg.APIToken, cfg.MailSource), cfg.RequestTimeout)
 
 	srv := &http.Server{
@@ -44,7 +55,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		slog.Info("слушаю", "addr", cfg.ListenAddr, "source", cfg.MailSource, "upstream", cfg.IMAPAddr)
+		slog.Info("слушаю", "addr", cfg.ListenAddr, "source", cfg.MailSource, "upstream", upstream)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("сервер остановился", "err", err)
 			os.Exit(1)

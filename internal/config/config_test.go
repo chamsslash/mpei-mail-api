@@ -27,8 +27,11 @@ func TestLoadDefaults(t *testing.T) {
 	if c.IMAPAddr != "mail.mpei.ru:993" {
 		t.Errorf("IMAPAddr = %q, want mail.mpei.ru:993", c.IMAPAddr)
 	}
-	if c.MailSource != "imap" {
-		t.Errorf("MailSource = %q, want imap", c.MailSource)
+	if c.MailSource != "owa" {
+		t.Errorf("MailSource = %q, want owa", c.MailSource)
+	}
+	if c.OWABaseURL != "https://mail.mpei.ru" {
+		t.Errorf("OWABaseURL = %q, want https://mail.mpei.ru", c.OWABaseURL)
 	}
 	if c.RequestTimeout.String() != "30s" {
 		t.Errorf("RequestTimeout = %v, want 30s", c.RequestTimeout)
@@ -41,6 +44,20 @@ func TestLoadRejectsUnknownSource(t *testing.T) {
 	}))
 	if err == nil {
 		t.Fatal("Load() с MAIL_SOURCE=pop3 должен возвращать ошибку")
+	}
+}
+
+func TestLoadAcceptsOWAAndIMAP(t *testing.T) {
+	for _, src := range []string{"imap", "owa"} {
+		c, err := Load(env(map[string]string{
+			"MPEI_USER": "u", "MPEI_PASS": "p", "API_TOKEN": "t", "MAIL_SOURCE": src,
+		}))
+		if err != nil {
+			t.Fatalf("MAIL_SOURCE=%s: %v", src, err)
+		}
+		if c.MailSource != src {
+			t.Errorf("MailSource = %q, want %q", c.MailSource, src)
+		}
 	}
 }
 
