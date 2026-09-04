@@ -115,14 +115,22 @@ func wrapHTTPErr(ctx context.Context, err error) error {
 }
 
 // inbox загружает страницу списка и попутно запоминает canary-токен.
+//
+// Отдельно проверяем, что пришла именно рабочая страница OWA: при перегрузке
+// Exchange отдаёт 200 с усечённой или служебной страницей без списка. Такой
+// ответ нельзя молча трактовать как «ящик пуст» — валидная страница OWA всегда
+// несёт canary-токен, поэтому его отсутствие считаем недоступностью апстрима.
 func (se *session) inbox(ctx context.Context) (string, error) {
 	html, err := se.do(ctx, http.MethodGet, se.src.base+"/owa/?modurl=0", nil)
 	if err != nil {
 		return "", err
 	}
-	if c := extractCanary(html); c != "" {
-		se.canary = c
+	c := extractCanary(html)
+	if c == "" {
+		slog.Error("OWA вернул страницу без canary — вероятно перегрузка", "size", len(html))
+		return "", mail.ErrUpstreamUnavailable
 	}
+	se.canary = c
 	return html, nil
 }
 
