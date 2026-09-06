@@ -1,4 +1,7 @@
-FROM golang:1.27 AS build
+# alpine, а не полный golang: тот тянет 1.32 ГБ против 373 МБ, и на небольшом
+# диске сервера сборка падает с «no space left on device». Бинарь всё равно
+# статический (CGO_ENABLED=0), так что от базового образа ничего не наследует.
+FROM golang:1.27-alpine AS build
 
 WORKDIR /src
 
