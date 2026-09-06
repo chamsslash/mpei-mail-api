@@ -4,6 +4,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gyattalert/mpei-mail-api/internal/mail"
 )
 
 // Тесты гоняются на реальных страницах OWA Light, снятых с mail.mpei.ru
@@ -269,4 +272,36 @@ func containsAny(s, chars string) bool {
 		}
 	}
 	return false
+}
+
+func TestSortNewestFirst(t *testing.T) {
+	at := func(s string) time.Time {
+		v, err := time.ParseInLocation("2006-01-02 15:04", s, mskLocation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	// Порядок как на живом ящике, отсортированном по отправителю.
+	msgs := []mail.Message{
+		{Subject: "БАРС", Date: at("2026-09-02 19:15")},
+		{Subject: "Марина", Date: at("2026-09-05 20:27")},
+		{Subject: "без даты", Date: time.Time{}},
+		{Subject: "Новостная", Date: at("2026-09-03 17:32")},
+		{Subject: "Симкина", Date: at("2026-09-04 13:31")},
+	}
+	sortNewestFirst(msgs)
+
+	got := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		got = append(got, m.Subject)
+	}
+	// Письма без даты уезжают в конец, чтобы не вытеснять свежие под limit.
+	want := []string{"Марина", "Симкина", "Новостная", "БАРС", "без даты"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("порядок = %v, want %v", got, want)
+		}
+	}
 }

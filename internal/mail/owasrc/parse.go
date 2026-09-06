@@ -3,6 +3,7 @@ package owasrc
 import (
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +32,68 @@ func extractCanary(page string) string {
 		return m[1]
 	}
 	return ""
+}
+
+// ---- контекст страницы списка ----
+
+// listContext — переменные страницы списка, из которых OWA собирает адрес
+// отправки формы (gtPrfx/gtFrmActn в msglst.js).
+//
+// Строить этот адрес по своему разумению нельзя: на стартовой странице
+// ae=StartPage и пустой t, а не Folder/IPF.Note, как можно решить по ссылкам
+// навигации. Форма, отправленная не туда, принимается сервером с кодом 200,
+// но команда молча не выполняется.
+type listContext struct {
+	ae     string
+	t      string
+	fldID  string // уже percent-encoded — подставляется в адрес как есть
+	slUsng string
+	pg     string
+}
+
+var (
+	reVarAe     = regexp.MustCompile(`var\s+a_sAe\s*=\s*"([^"]*)"`)
+	reVarT      = regexp.MustCompile(`var\s+a_sT\s*=\s*"([^"]*)"`)
+	reVarFldID  = regexp.MustCompile(`var\s+a_sFldId\s*=\s*"([^"]*)"`)
+	reVarSlUsng = regexp.MustCompile(`var\s+a_iSlUsng\s*=\s*(\d+)`)
+	reVarPg     = regexp.MustCompile(`var\s+a_sPg\s*=\s*"([^"]*)"`)
+)
+
+func firstGroup(re *regexp.Regexp, s string) string {
+	if m := re.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+func parseListContext(page string) listContext {
+	lc := listContext{
+		ae:     firstGroup(reVarAe, page),
+		t:      firstGroup(reVarT, page),
+		fldID:  firstGroup(reVarFldID, page),
+		slUsng: firstGroup(reVarSlUsng, page),
+		pg:     firstGroup(reVarPg, page),
+	}
+	if lc.slUsng == "" {
+		lc.slUsng = "0"
+	}
+	return lc
+}
+
+// formAction повторяет gtFrmActn() из msglst.js.
+func (lc listContext) formAction(base string) string {
+	if lc.ae == "" {
+		return ""
+	}
+	p := "?ae=" + lc.ae
+	if lc.t != "" {
+		p += "&t=" + lc.t
+	}
+	p += "&id=" + lc.fldID + "&slUsng=" + lc.slUsng
+	if lc.pg != "" {
+		p += "&pg=" + lc.pg
+	}
+	return base + "/owa/" + p
 }
 
 // ---- папки ящика ----
@@ -208,6 +271,25 @@ func dateFromRow(cells []*html.Node) string {
 		}
 	}
 	return ""
+}
+
+// sortNewestFirst упорядочивает письма от свежих к старым.
+//
+// Полагаться на порядок строк OWA нельзя: он зависит от того, по какой
+// колонке ящик в последний раз отсортировали в веб-интерфейсе, и эта
+// настройка запоминается на сервере (на живом ящике наблюдалась сортировка
+// по отправителю). Контракт же обещает свежие письма первыми, и именно из
+// этого порядка limit берёт первые N.
+func sortNewestFirst(msgs []mail.Message) {
+	sort.SliceStable(msgs, func(i, j int) bool {
+		a, b := msgs[i].Date, msgs[j].Date
+		// Письма с неразобранной датой уезжают в конец, чтобы не вытеснять
+		// заведомо свежие из выдачи под limit.
+		if a.IsZero() != b.IsZero() {
+			return !a.IsZero()
+		}
+		return a.After(b)
+	})
 }
 
 func filterList(msgs []mail.Message, q mail.ListQuery) []mail.Message {

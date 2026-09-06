@@ -46,6 +46,7 @@ type session struct {
 	src    *Source
 	client *http.Client
 	canary string
+	lc     listContext
 }
 
 func (s *Source) newSession(ctx context.Context) (*session, error) {
@@ -107,6 +108,23 @@ func (se *session) do(ctx context.Context, method, u string, body io.Reader) (st
 	}
 }
 
+// userContext возвращает значение cookie UserContext — именно его OWA кладёт
+// в поле hidcanary перед отправкой формы (sbtFrm в cmn.js), затирая значение
+// из разметки. Форма с «страничным» токеном отвергается молча: сервер
+// отвечает 200 и не делает ничего.
+func (se *session) userContext() string {
+	u, err := url.Parse(se.src.base)
+	if err != nil {
+		return ""
+	}
+	for _, c := range se.client.Jar.Cookies(u) {
+		if c.Name == "UserContext" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
 func wrapHTTPErr(ctx context.Context, err error) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return mail.ErrUpstreamTimeout
@@ -145,6 +163,8 @@ func (se *session) openFolder(ctx context.Context, mailbox string) (string, fold
 		return "", folder{}, err
 	}
 
+	se.lc = parseListContext(root)
+
 	f, ok := resolveFolder(root, mailbox)
 	if !ok {
 		// Для «Входящих» отсутствие ссылки в навигации — не повод падать:
@@ -165,6 +185,7 @@ func (se *session) openFolder(ctx context.Context, mailbox string) (string, fold
 	if err != nil {
 		return "", folder{}, err
 	}
+	se.lc = parseListContext(page)
 	return page, f, nil
 }
 
@@ -198,6 +219,7 @@ func (s *Source) List(ctx context.Context, q mail.ListQuery) ([]mail.Message, er
 
 	msgs := parseInbox(page)
 	msgs = filterList(msgs, q)
+	sortNewestFirst(msgs)
 
 	if q.Limit > 0 && len(msgs) > q.Limit {
 		msgs = msgs[:q.Limit]
@@ -220,12 +242,11 @@ func (s *Source) Get(ctx context.Context, mailbox, uid string) (*mail.MessageFul
 	// Узнаём исходный флаг «прочитано» до открытия: OWA помечает письмо
 	// прочитанным в момент чтения, а контракт требует, чтобы GET не менял
 	// состояние ящика. Если письмо было непрочитанным — вернём флаг после.
-	list, f, err := se.openFolder(ctx, mailbox)
+	list, _, err := se.openFolder(ctx, mailbox)
 	if err != nil {
 		return nil, err
 	}
 	wasUnread := isUnread(list, itemID)
-	folderID := f.ID
 
 	readURL := se.src.base + "/owa/?ae=Item&t=IPM.Note&a=Read&id=" + url.QueryEscape(itemID)
 	page, err := se.do(ctx, http.MethodGet, readURL, nil)
@@ -238,16 +259,12 @@ func (s *Source) Get(ctx context.Context, mailbox, uid string) (*mail.MessageFul
 
 	full := parseMessage(page)
 	full.UID = uid
+	// Страница чтения флаг не показывает — он известен только из списка,
+	// снятого до открытия. Без этого ручка всегда отдавала seen=false.
+	full.Seen = !wasUnread
 
 	if wasUnread {
-		full.Seen = false
-		// Открытие письма ротирует canary: для восстановления флага нужен
-		// свежий токен со страницы чтения, старый (со списка) сервер молча
-		// проигнорирует, вернув при этом 200.
-		if c := extractCanary(page); c != "" {
-			se.canary = c
-		}
-		if err := se.mark(ctx, folderID, itemID, "markunread"); err != nil {
+		if err := se.mark(ctx, itemID, "markunread"); err != nil {
 			// Восстановить флаг не удалось — это побочный эффект, а не отказ
 			// операции: письмо пользователь получил. Только предупреждаем.
 			slog.Warn("не удалось вернуть письму флаг непрочитанного", "err", err)
@@ -268,7 +285,7 @@ func (s *Source) MarkSeen(ctx context.Context, mailbox, uid string) error {
 		return err
 	}
 	defer se.close(ctx)
-	list, f, err := se.openFolder(ctx, mailbox)
+	list, _, err := se.openFolder(ctx, mailbox)
 	if err != nil {
 		return err
 	}
@@ -277,28 +294,42 @@ func (s *Source) MarkSeen(ctx context.Context, mailbox, uid string) error {
 		return nil
 	}
 
-	return se.mark(ctx, f.ID, itemID, "markread")
+	return se.mark(ctx, itemID, "markread")
 }
 
-// mark отправляет команду markread/markunread формой OWA. Без canary сервер
-// отклонит POST как CSRF.
-func (se *session) mark(ctx context.Context, folderID, itemID, cmd string) error {
-	if se.canary == "" {
+// mark отправляет команду markread/markunread формой списка — так же, как
+// это делает сам OWA (submtCmd + sbtFrm в msglst.js/cmn.js):
+//
+//   - адрес берётся из переменных страницы (gtFrmActn), а не собирается
+//     вручную из ссылок навигации;
+//   - hidcanary заполняется значением cookie UserContext;
+//   - скрытое поле X-OWA-CANARY уходит вместе с остальной формой.
+//
+// Отступление от этого набора сервер не отвергает: он отвечает 200 и просто
+// не выполняет команду, из-за чего ошибка выглядит как успех.
+func (se *session) mark(ctx context.Context, itemID, cmd string) error {
+	action := se.lc.formAction(se.src.base)
+	canary := se.userContext()
+	if action == "" || canary == "" {
+		slog.Error("нет контекста формы OWA для команды", "cmd", cmd, "hasAction", action != "", "hasCanary", canary != "")
 		return mail.ErrUpstreamUnavailable
 	}
+
 	form := url.Values{
-		"hidcmdpst":    {cmd},
-		"chkmsg":       {itemID},
-		"X-OWA-CANARY": {se.canary},
-		"hidpid":       {"MessageView"},
-		"hidactbrfld":  {""},
-		"hidso":        {""},
+		"hidcmdpst":   {cmd},
+		"chkmsg":      {itemID},
+		"hidcanary":   {canary},
+		"hidpid":      {"MessageView"},
+		"hidactbrfld": {""},
+		"hidso":       {""},
+		"hidcid":      {""},
+		"hidpnst":     {""},
 	}
-	u := se.src.base + "/owa/?ae=Folder&t=IPF.Note"
-	if folderID != "" {
-		u += "&id=" + url.QueryEscape(folderID)
+	if se.canary != "" {
+		form.Set("X-OWA-CANARY", se.canary)
 	}
-	_, err := se.do(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+
+	_, err := se.do(ctx, http.MethodPost, action, strings.NewReader(form.Encode()))
 	return err
 }
 
