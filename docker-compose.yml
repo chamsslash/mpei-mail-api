@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    image: mpei-mail-api:local
+    env_file: .env
+    # Наружу торчать незачем: потребитель — шедулер, он ходит с этой же машины.
+    # Если сервис нужен другим хостам, ставь BIND_ADDR=0.0.0.0 и прикрывай
+    # его чем-то, что умеет TLS — сам он ходит по HTTP и токен летит открытым.
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+    restart: unless-stopped
+    # Образ distroless — внутри нет ни шелла, ни curl, поэтому HEALTHCHECK
+    # докера здесь не сделать. Здоровье проверяет deploy.sh снаружи, по /healthz.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
