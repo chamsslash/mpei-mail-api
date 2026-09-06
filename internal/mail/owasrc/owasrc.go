@@ -134,6 +134,40 @@ func (se *session) inbox(ctx context.Context) (string, error) {
 	return html, nil
 }
 
+// openFolder открывает папку ящика и возвращает её страницу со списком писем
+// вместе с самой папкой.
+//
+// Корневая страница OWA — это и есть «Входящие», поэтому для них
+// дополнительный запрос не нужен; за остальными папками надо сходить.
+func (se *session) openFolder(ctx context.Context, mailbox string) (string, folder, error) {
+	root, err := se.inbox(ctx)
+	if err != nil {
+		return "", folder{}, err
+	}
+
+	f, ok := resolveFolder(root, mailbox)
+	if !ok {
+		// Для «Входящих» отсутствие ссылки в навигации — не повод падать:
+		// нужная страница уже загружена, а id папки идёт лишь контекстом
+		// POST-команд и допускает пустое значение.
+		if isInboxName(mailbox) {
+			return root, folder{}, nil
+		}
+		slog.Warn("запрошена папка, которой нет в ящике", "mailbox", mailbox)
+		return "", folder{}, mail.ErrMailboxNotFound
+	}
+	if isInboxName(mailbox) {
+		return root, f, nil
+	}
+
+	page, err := se.do(ctx, http.MethodGet,
+		se.src.base+"/owa/?ae=Folder&t=IPF.Note&id="+url.QueryEscape(f.ID), nil)
+	if err != nil {
+		return "", folder{}, err
+	}
+	return page, f, nil
+}
+
 func (s *Source) Ping(ctx context.Context) error {
 	se, err := s.newSession(ctx)
 	if err != nil {
@@ -157,12 +191,12 @@ func (s *Source) List(ctx context.Context, q mail.ListQuery) ([]mail.Message, er
 		return nil, err
 	}
 	defer se.close(ctx)
-	html, err := se.inbox(ctx)
+	page, _, err := se.openFolder(ctx, q.Mailbox)
 	if err != nil {
 		return nil, err
 	}
 
-	msgs := parseInbox(html)
+	msgs := parseInbox(page)
 	msgs = filterList(msgs, q)
 
 	if q.Limit > 0 && len(msgs) > q.Limit {
@@ -171,7 +205,7 @@ func (s *Source) List(ctx context.Context, q mail.ListQuery) ([]mail.Message, er
 	return msgs, nil
 }
 
-func (s *Source) Get(ctx context.Context, _, uid string) (*mail.MessageFull, error) {
+func (s *Source) Get(ctx context.Context, mailbox, uid string) (*mail.MessageFull, error) {
 	itemID, err := decodeUID(uid)
 	if err != nil {
 		return nil, err
@@ -186,12 +220,12 @@ func (s *Source) Get(ctx context.Context, _, uid string) (*mail.MessageFull, err
 	// Узнаём исходный флаг «прочитано» до открытия: OWA помечает письмо
 	// прочитанным в момент чтения, а контракт требует, чтобы GET не менял
 	// состояние ящика. Если письмо было непрочитанным — вернём флаг после.
-	inbox, err := se.inbox(ctx)
+	list, f, err := se.openFolder(ctx, mailbox)
 	if err != nil {
 		return nil, err
 	}
-	wasUnread := isUnread(inbox, itemID)
-	folderID := extractFolderID(inbox)
+	wasUnread := isUnread(list, itemID)
+	folderID := f.ID
 
 	readURL := se.src.base + "/owa/?ae=Item&t=IPM.Note&a=Read&id=" + url.QueryEscape(itemID)
 	page, err := se.do(ctx, http.MethodGet, readURL, nil)
@@ -223,7 +257,7 @@ func (s *Source) Get(ctx context.Context, _, uid string) (*mail.MessageFull, err
 	return full, nil
 }
 
-func (s *Source) MarkSeen(ctx context.Context, _, uid string) error {
+func (s *Source) MarkSeen(ctx context.Context, mailbox, uid string) error {
 	itemID, err := decodeUID(uid)
 	if err != nil {
 		return err
@@ -234,16 +268,16 @@ func (s *Source) MarkSeen(ctx context.Context, _, uid string) error {
 		return err
 	}
 	defer se.close(ctx)
-	inbox, err := se.inbox(ctx)
+	list, f, err := se.openFolder(ctx, mailbox)
 	if err != nil {
 		return err
 	}
 	// Идемпотентность: письмо уже прочитано — делать нечего.
-	if !isUnread(inbox, itemID) {
+	if !isUnread(list, itemID) {
 		return nil
 	}
 
-	return se.mark(ctx, extractFolderID(inbox), itemID, "markread")
+	return se.mark(ctx, f.ID, itemID, "markread")
 }
 
 // mark отправляет команду markread/markunread формой OWA. Без canary сервер

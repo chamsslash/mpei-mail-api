@@ -42,6 +42,10 @@ func writeSourceErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, mail.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "message_not_found", "письмо не найдено")
+	// Несуществующая папка — ошибка параметров запроса, а не апстрима:
+	// ретраить её бессмысленно, чинится она на стороне потребителя.
+	case errors.Is(err, mail.ErrMailboxNotFound):
+		writeErr(w, http.StatusBadRequest, "bad_request", "папка не найдена")
 	case errors.Is(err, mail.ErrUpstreamTimeout), errors.Is(err, context.DeadlineExceeded):
 		writeErr(w, http.StatusGatewayTimeout, "upstream_timeout", "почтовый сервер не ответил вовремя")
 	case errors.Is(err, mail.ErrUpstreamUnavailable):

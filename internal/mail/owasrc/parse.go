@@ -1,6 +1,7 @@
 package owasrc
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -32,18 +33,90 @@ func extractCanary(page string) string {
 	return ""
 }
 
-// extractFolderID достаёт id папки «Входящие» из ссылки на неё — он нужен
-// как контекст для POST-команд markread/markunread.
-var folderIDRe = regexp.MustCompile(`name="lnkFldr"\s+href="[^"]*[?&]id=([^&"]+)`)
+// ---- папки ящика ----
 
-func extractFolderID(page string) string {
-	if m := folderIDRe.FindStringSubmatch(page); m != nil {
-		if id, err := urlUnescape(m[1]); err == nil {
-			return id
-		}
-		return m[1]
+// folder — папка ящика из навигации OWA. ID нужен и как контекст для
+// POST-команд markread/markunread, и чтобы открыть саму папку.
+type folder struct {
+	Title string
+	ID    string
+}
+
+// parseFolders собирает папки из навигации: каждая — ссылка lnkFldr, подпись
+// лежит в title, идентификатор — в параметре id.
+func parseFolders(page string) []folder {
+	root, err := html.Parse(strings.NewReader(page))
+	if err != nil {
+		return nil
 	}
-	return ""
+
+	var out []folder
+	walk(root, func(n *html.Node) {
+		if n.Type != html.ElementNode || n.Data != "a" || attr(n, "name") != "lnkFldr" {
+			return
+		}
+		u, err := url.Parse(attr(n, "href"))
+		if err != nil {
+			return
+		}
+		id := u.Query().Get("id")
+		if id == "" {
+			return
+		}
+		title := cleanText(attr(n, "title"))
+		if title == "" {
+			title = cleanText(text(n))
+		}
+		out = append(out, folder{Title: title, ID: id})
+	})
+	return out
+}
+
+// mailboxAliases переводит привычные имена ящиков в подписи папок OWA:
+// контракт ручек говорит INBOX, а Exchange МЭИ печатает русские названия.
+var mailboxAliases = map[string]string{
+	"inbox":         "входящие",
+	"sent":          "отправленные",
+	"sent items":    "отправленные",
+	"drafts":        "черновики",
+	"trash":         "удаленные",
+	"deleted":       "удаленные",
+	"deleted items": "удаленные",
+	"junk":          "нежелательная почта",
+	"spam":          "нежелательная почта",
+}
+
+// normalizeFolderName приводит имя к сравнимому виду: регистр не важен, а «ё»
+// в названиях папок OWA пишет то так, то иначе («Удаленные»/«Удалённые»).
+func normalizeFolderName(s string) string {
+	return strings.ReplaceAll(strings.ToLower(cleanText(s)), "ё", "е")
+}
+
+func isInboxName(mailbox string) bool {
+	m := normalizeFolderName(mailbox)
+	return m == "" || m == "inbox" || m == "входящие"
+}
+
+// resolveFolder ищет папку по имени среди навигации страницы.
+//
+// Возвращает false, если такой папки в ящике нет. Молча откатываться на
+// «Входящие» нельзя: потребитель получил бы письма другой папки под видом
+// запрошенной и не смог бы отличить это от пустого результата.
+func resolveFolder(page, mailbox string) (folder, bool) {
+	want := normalizeFolderName(mailbox)
+	if want == "" {
+		want = "inbox"
+	}
+	if alias, ok := mailboxAliases[want]; ok {
+		want = normalizeFolderName(alias)
+	}
+
+	for _, f := range parseFolders(page) {
+		if normalizeFolderName(f.Title) == want {
+			return f, true
+		}
+	}
+	return folder{}, false
 }
 
 // ---- список писем ----
@@ -174,7 +247,16 @@ func parseMessage(page string) *mail.MessageFull {
 		full.From = parseAddressField(headers["от"])
 	}
 
-	full.Text = cleanText(firstByClass(root, "bdy"))
+	// Тело письма лежит в div.bdy внутри td.bdy — берём именно внутренний
+	// div: во внешней ячейке кроме тела живёт вёрстка OWA.
+	body := findFirst(root, func(n *html.Node) bool { return n.Data == "div" && hasClass(n, "bdy") })
+	if body == nil {
+		body = findFirst(root, func(n *html.Node) bool { return hasClass(n, "bdy") })
+	}
+	if body != nil {
+		full.HTML = renderInner(body)
+		full.Text = cleanMultiline(blockText(body))
+	}
 
 	// Вложения лежат ссылками на attachment.ashx внутри контейнера divAtt,
 	// в тексте — «имя (размер)». Содержимое файлов не тянем, только метаданные.
@@ -182,7 +264,11 @@ func parseMessage(page string) *mail.MessageFull {
 		walk(att, func(n *html.Node) {
 			if n.Type == html.ElementNode && n.Data == "a" && strings.Contains(attr(n, "href"), "attachment.ashx") {
 				if name, size := parseAttachment(cleanText(text(n))); name != "" {
-					full.Attachments = append(full.Attachments, mail.Attachment{Name: name, Size: size})
+					full.Attachments = append(full.Attachments, mail.Attachment{
+						Name: name,
+						MIME: mimeByName(name),
+						Size: size,
+					})
 				}
 			}
 		})
@@ -190,7 +276,8 @@ func parseMessage(page string) *mail.MessageFull {
 	full.HasAttachments = len(full.Attachments) > 0
 
 	if full.Text != "" {
-		full.Snippet = truncateRunes(full.Text, 300)
+		// Сниппет — одной строкой: разбиение на абзацы в нём только мешает.
+		full.Snippet = truncateRunes(singleLine(full.Text), 300)
 	}
 	return full
 }

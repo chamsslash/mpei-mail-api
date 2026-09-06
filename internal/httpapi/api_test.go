@@ -194,6 +194,9 @@ func TestUpstreamErrorsMapToCodes(t *testing.T) {
 		{mail.ErrNotFound, http.StatusNotFound, "message_not_found"},
 		{mail.ErrUpstreamUnavailable, http.StatusBadGateway, "upstream_unavailable"},
 		{mail.ErrUpstreamTimeout, http.StatusGatewayTimeout, "upstream_timeout"},
+		// Несуществующая папка — вина запроса, а не апстрима: ретрай её не
+		// вылечит, поэтому 400, а не 502.
+		{mail.ErrMailboxNotFound, http.StatusBadRequest, "bad_request"},
 	} {
 		rec := do(t, New(&fakeSource{err: tc.err}, "s", "imap"), "GET", "/messages/1", "s")
 		if rec.Code != tc.status {
