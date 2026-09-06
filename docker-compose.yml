@@ -3,9 +3,9 @@ services:
     build: .
     image: mpei-mail-api:local
     env_file: .env
-    # Наружу торчать незачем: потребитель — шедулер, он ходит с этой же машины.
-    # Если сервис нужен другим хостам, ставь BIND_ADDR=0.0.0.0 и прикрывай
-    # его чем-то, что умеет TLS — сам он ходит по HTTP и токен летит открытым.
+    # Наружу сервис публикует Caddy, поэтому сам api виден только на localhost
+    # сервера: HTTP-порт в интернете означал бы Bearer-токен открытым текстом.
+    # Этот проброс нужен для healthz-проверки деплоя и отладки с самой машины.
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
     restart: unless-stopped
@@ -16,3 +16,32 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - api
+    restart: unless-stopped
+    # 80 нужен не только для редиректа: по нему Let's Encrypt проверяет
+    # владение адресом (HTTP-01). Закроешь — сертификат не выдастся.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDR: ${SITE_ADDR}
+    volumes:
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      # Именованный том обязателен: в нём лежат выданные сертификаты и ключ
+      # ACME-аккаунта. Без него каждый передеплой запрашивал бы сертификат
+      # заново и упёрся бы в лимиты Let's Encrypt.
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
