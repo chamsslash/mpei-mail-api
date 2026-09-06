@@ -27,21 +27,40 @@ else
 fi
 
 # --- конфиг ---------------------------------------------------------------
+envval() {
+  local line
+  line="$(grep -E "^$1=" .env | head -1 || true)"
+  printf '%s' "${line#*=}"
+}
+
+# Кредов в .env.example достаточно для запуска, поэтому первый прогон не
+# требует ручной правки: копируем и идём дальше.
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  die ".env не было — создал из .env.example. Заполни MPEI_USER, MPEI_PASS и API_TOKEN и запусти снова.
-Токен: openssl rand -hex 32"
+  echo "==> .env не было — создал из .env.example"
+fi
+
+# Токен генерируем сами: заставлять человека придумывать его руками незачем,
+# а пустой API_TOKEN уронил бы сервис (он намеренно не стартует без токена).
+if [[ -z "$(envval API_TOKEN)" ]]; then
+  tok="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$tok" ]] || die "не удалось сгенерировать API_TOKEN (нет ни openssl, ни /dev/urandom)"
+  if grep -qE '^API_TOKEN=' .env; then
+    sed -i.bak "s|^API_TOKEN=.*|API_TOKEN=${tok}|" .env && rm -f .env.bak
+  else
+    printf 'API_TOKEN=%s\n' "$tok" >> .env
+  fi
+  echo "==> API_TOKEN не был задан, сгенерировал: ${tok}"
 fi
 
 # Пустые обязательные переменные ловим здесь: иначе контейнер молча уйдёт в
 # рестарт-петлю, а причина будет видна только в логах.
 for v in MPEI_USER MPEI_PASS API_TOKEN; do
-  line="$(grep -E "^${v}=" .env || true)"
-  [[ -n "$line" ]] || die "в .env нет переменной ${v}"
-  [[ -n "${line#*=}" ]] || die "в .env не заполнена переменная ${v}"
+  grep -qE "^${v}=" .env || die "в .env нет переменной ${v}"
+  [[ -n "$(envval "$v")" ]] || die "в .env не заполнена переменная ${v}"
 done
 
-PORT="$(grep -E '^HOST_PORT=' .env | cut -d= -f2- || true)"; PORT="${PORT:-8080}"
+PORT="$(envval HOST_PORT)"; PORT="${PORT:-8080}"
 
 # --- код ------------------------------------------------------------------
 if [[ $PULL -eq 1 ]]; then
