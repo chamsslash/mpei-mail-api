@@ -207,6 +207,12 @@ func (s *Source) Get(ctx context.Context, _, uid string) (*mail.MessageFull, err
 
 	if wasUnread {
 		full.Seen = false
+		// Открытие письма ротирует canary: для восстановления флага нужен
+		// свежий токен со страницы чтения, старый (со списка) сервер молча
+		// проигнорирует, вернув при этом 200.
+		if c := extractCanary(page); c != "" {
+			se.canary = c
+		}
 		if err := se.mark(ctx, folderID, itemID, "markunread"); err != nil {
 			// Восстановить флаг не удалось — это побочный эффект, а не отказ
 			// операции: письмо пользователь получил. Только предупреждаем.
