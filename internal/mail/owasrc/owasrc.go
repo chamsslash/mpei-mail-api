@@ -246,8 +246,68 @@ func (s *Source) Get(ctx context.Context, mailbox, uid string) (*mail.MessageFul
 	if err != nil {
 		return nil, err
 	}
-	wasUnread := isUnread(list, itemID)
+	return se.readItem(ctx, itemID, uid, isUnread(list, itemID))
+}
 
+// GetMany забирает несколько писем в одной сессии.
+//
+// Существует отдельно от Get не ради удобства, а потому что повторять Get в
+// цикле нельзя: он на каждое письмо логинится заново и заново тянет листинг
+// папки. Два десятка писем превращаются в два десятка логинов за секунды, и
+// Exchange отвечает auth_error, а затем 500 — ящик временно перестаёт пускать
+// вообще (см. комментарий к close про лимит сессий).
+//
+// Здесь логин и листинг делаются по одному разу на всю пачку.
+//
+// Ошибки возвращаются позиционно: errs[i] относится к uids[i], и обе слайса
+// всегда длиной с uids. Так вызывающий отличает «письмо не прочиталось» от
+// «сломалась вся выборка» — первое не повод отдавать ошибку целиком.
+func (s *Source) GetMany(ctx context.Context, mailbox string, uids []string) ([]*mail.MessageFull, []error) {
+	out := make([]*mail.MessageFull, len(uids))
+	errs := make([]error, len(uids))
+
+	se, err := s.newSession(ctx)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return out, errs
+	}
+	defer se.close(ctx)
+
+	list, _, err := se.openFolder(ctx, mailbox)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return out, errs
+	}
+
+	for i, uid := range uids {
+		// Отменённый контекст означает, что ответа уже никто не ждёт: дальше
+		// дёргать почтовый сервер незачем.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			for j := i; j < len(errs); j++ {
+				errs[j] = ctxErr
+			}
+			return out, errs
+		}
+
+		itemID, err := decodeUID(uid)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		out[i], errs[i] = se.readItem(ctx, itemID, uid, isUnread(list, itemID))
+	}
+
+	return out, errs
+}
+
+// readItem читает одно письмо в уже открытой сессии. wasUnread приходит
+// снаружи: флаг виден только в листинге папки, снятом до открытия письма, а в
+// пачке листинг снимается один раз на всех.
+func (se *session) readItem(ctx context.Context, itemID, uid string, wasUnread bool) (*mail.MessageFull, error) {
 	readURL := se.src.base + "/owa/?ae=Item&t=IPM.Note&a=Read&id=" + url.QueryEscape(itemID)
 	page, err := se.do(ctx, http.MethodGet, readURL, nil)
 	if err != nil {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -88,31 +89,51 @@ func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
 // таймауту раньше.
 const maxFullLimit = 50
 
-// writeFullList дозагружает тела к уже полученному листингу. Живёт в HTTP-слое,
-// а не в Source, намеренно: это склейка двух существующих операций, одинаковая
-// для любого источника, и добавлять её в интерфейс значило бы дублировать
-// реализацию в imapsrc и owasrc.
+// batchGetter — источник, умеющий забрать пачку писем дешевле, чем повторный
+// вызов Get. Опциональный интерфейс, а не часть mail.Source: для IMAP разницы
+// нет, а обязательный метод заставил бы писать там пустую обёртку.
+type batchGetter interface {
+	GetMany(ctx context.Context, mailbox string, uids []string) ([]*mail.MessageFull, []error)
+}
+
+// writeFullList дозагружает тела к уже полученному листингу.
+//
+// Через batchGetter, если источник его поддерживает. Это не оптимизация, а
+// условие работоспособности: у OWA каждый Get — отдельный логин, и два десятка
+// логинов подряд Exchange встречает auth_error, после чего ящик временно не
+// пускает вообще. Пакетный путь укладывается в один логин.
 func (a *api) writeFullList(w http.ResponseWriter, r *http.Request, mailbox string, msgs []mail.Message) {
 	truncated := false
 	if len(msgs) > maxFullLimit {
 		msgs, truncated = msgs[:maxFullLimit], true
 	}
 
-	out := make([]*mail.MessageFull, 0, len(msgs))
-	failed := 0
-	for _, m := range msgs {
-		// Клиент мог отвалиться или истечь по таймауту: продолжать ходить в
-		// почтовый сервер за письмами, которые никто не прочитает, незачем.
-		if err := r.Context().Err(); err != nil {
-			writeErr(w, http.StatusGatewayTimeout, "upstream_timeout", "выборка не уложилась в таймаут запроса")
-			return
-		}
+	uids := make([]string, len(msgs))
+	for i, m := range msgs {
+		uids[i] = m.UID
+	}
 
-		full, err := a.src.Get(r.Context(), mailbox, m.UID)
-		if err != nil || full == nil {
+	var (
+		got  []*mail.MessageFull
+		errs []error
+	)
+	if b, ok := a.src.(batchGetter); ok {
+		got, errs = b.GetMany(r.Context(), mailbox, uids)
+	} else {
+		got, errs = a.getSequentially(r.Context(), mailbox, uids)
+	}
+
+	out := make([]*mail.MessageFull, 0, len(got))
+	failed := 0
+	for i, full := range got {
+		if full == nil || (i < len(errs) && errs[i] != nil) {
 			// Одно нечитаемое письмо не должно рушить всю историю: пропускаем
 			// его и сообщаем счётчиком, сколько потерялось.
-			slog.Warn("не удалось забрать тело письма", "mailbox", mailbox, "uid", m.UID, "err", err)
+			var err error
+			if i < len(errs) {
+				err = errs[i]
+			}
+			slog.Warn("не удалось забрать тело письма", "mailbox", mailbox, "uid", uids[i], "err", err)
 			failed++
 			continue
 		}
@@ -125,6 +146,22 @@ func (a *api) writeFullList(w http.ResponseWriter, r *http.Request, mailbox stri
 		"failed":    failed,
 		"truncated": truncated,
 	})
+}
+
+// getSequentially — запасной путь для источников без GetMany.
+func (a *api) getSequentially(ctx context.Context, mailbox string, uids []string) ([]*mail.MessageFull, []error) {
+	out := make([]*mail.MessageFull, len(uids))
+	errs := make([]error, len(uids))
+	for i, uid := range uids {
+		if err := ctx.Err(); err != nil {
+			for j := i; j < len(errs); j++ {
+				errs[j] = err
+			}
+			break
+		}
+		out[i], errs[i] = a.src.Get(ctx, mailbox, uid)
+	}
+	return out, errs
 }
 
 func (a *api) handleGet(w http.ResponseWriter, r *http.Request) {

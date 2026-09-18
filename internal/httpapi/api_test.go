@@ -330,3 +330,47 @@ func TestListFullTruncatesAtMax(t *testing.T) {
 		t.Fatalf("count=%d truncated=%v, want %d/true", body.Count, body.Truncated, maxFullLimit)
 	}
 }
+
+// fakeBatchSource умеет GetMany — как owasrc. Нужен, чтобы проверить, что
+// HTTP-слой выбирает пакетный путь, а не бьёт источник по одному письму.
+type fakeBatchSource struct {
+	fakeSource
+	batchCalls int
+	batchUIDs  []string
+}
+
+func (f *fakeBatchSource) GetMany(_ context.Context, _ string, uids []string) ([]*mail.MessageFull, []error) {
+	f.batchCalls++
+	f.batchUIDs = uids
+	out := make([]*mail.MessageFull, len(uids))
+	errs := make([]error, len(uids))
+	for i := range uids {
+		out[i] = f.full
+	}
+	return out, errs
+}
+
+// Источник с GetMany должен опрашиваться одним вызовом. Для OWA это не вопрос
+// скорости: повторный Get там означает повторный логин, а серия логинов
+// временно закрывает доступ к ящику.
+func TestListFullUsesBatchWhenAvailable(t *testing.T) {
+	src := &fakeBatchSource{
+		fakeSource: fakeSource{
+			list: []mail.Message{{UID: "1"}, {UID: "2"}, {UID: "3"}},
+			full: &mail.MessageFull{Text: "тело"},
+		},
+	}
+	rec := do(t, New(src, "s", "owa"), "GET", "/messages?full=true", "s")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if src.batchCalls != 1 {
+		t.Errorf("GetMany вызван %d раз, want 1", src.batchCalls)
+	}
+	if len(src.getCalls) != 0 {
+		t.Errorf("Get вызван %d раз, хотя источник пакетный", len(src.getCalls))
+	}
+	if len(src.batchUIDs) != 3 {
+		t.Errorf("в пачку ушло %d uid, want 3", len(src.batchUIDs))
+	}
+}
