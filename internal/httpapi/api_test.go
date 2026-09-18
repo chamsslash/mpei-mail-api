@@ -20,6 +20,8 @@ type fakeSource struct {
 	seenUID     string
 	seenMailbox string
 	lastQuery   mail.ListQuery
+	getCalls    []string
+	failUIDs    map[string]bool
 }
 
 func (f *fakeSource) List(_ context.Context, q mail.ListQuery) ([]mail.Message, error) {
@@ -27,7 +29,11 @@ func (f *fakeSource) List(_ context.Context, q mail.ListQuery) ([]mail.Message, 
 	return f.list, f.err
 }
 
-func (f *fakeSource) Get(_ context.Context, _, _ string) (*mail.MessageFull, error) {
+func (f *fakeSource) Get(_ context.Context, _, uid string) (*mail.MessageFull, error) {
+	f.getCalls = append(f.getCalls, uid)
+	if f.failUIDs[uid] {
+		return nil, mail.ErrUpstreamUnavailable
+	}
 	return f.full, f.err
 }
 
@@ -245,5 +251,82 @@ func TestMailboxParamPassedThrough(t *testing.T) {
 	do(t, New(src, "s", "imap"), "POST", "/messages/1/seen?mailbox=Sent", "s")
 	if src.seenMailbox != "Sent" {
 		t.Errorf("seenMailbox = %q, want Sent", src.seenMailbox)
+	}
+}
+
+// ?full=true склеивает листинг с телами: одного запроса должно хватать, чтобы
+// собрать историю, вместо N+1 походов со стороны потребителя.
+func TestListFullLoadsBodies(t *testing.T) {
+	src := &fakeSource{
+		list: []mail.Message{{UID: "1"}, {UID: "2"}},
+		full: &mail.MessageFull{Text: "тело"},
+	}
+	rec := do(t, New(src, "s", "owa"), "GET", "/messages?full=true", "s")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Messages  []mail.MessageFull `json:"messages"`
+		Count     int                `json:"count"`
+		Failed    int                `json:"failed"`
+		Truncated bool               `json:"truncated"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Count != 2 || body.Failed != 0 || body.Truncated {
+		t.Fatalf("тело = %+v", body)
+	}
+	if body.Messages[0].Text != "тело" {
+		t.Errorf("текст письма не доехал: %+v", body.Messages[0])
+	}
+	if len(src.getCalls) != 2 {
+		t.Errorf("Get вызван %d раз, want 2", len(src.getCalls))
+	}
+}
+
+// Нечитаемое письмо не должно ронять всю выборку — история собирается
+// пакетно, и один сбойный элемент из двадцати это не повод отдать 502.
+func TestListFullSkipsUnreadable(t *testing.T) {
+	src := &fakeSource{
+		list:     []mail.Message{{UID: "1"}, {UID: "2"}},
+		full:     &mail.MessageFull{Text: "тело"},
+		failUIDs: map[string]bool{"2": true},
+	}
+	rec := do(t, New(src, "s", "owa"), "GET", "/messages?full=true", "s")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Count  int `json:"count"`
+		Failed int `json:"failed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Count != 1 || body.Failed != 1 {
+		t.Fatalf("count=%d failed=%d, want 1/1", body.Count, body.Failed)
+	}
+}
+
+// Потолок full отдельный от limit: иначе один запрос уходил бы в почтовый
+// сервер на десятки минут.
+func TestListFullTruncatesAtMax(t *testing.T) {
+	list := make([]mail.Message, maxFullLimit+10)
+	for i := range list {
+		list[i].UID = string(rune('a' + i%26))
+	}
+	src := &fakeSource{list: list, full: &mail.MessageFull{}}
+	rec := do(t, New(src, "s", "owa"), "GET", "/messages?full=true&limit=100", "s")
+
+	var body struct {
+		Count     int  `json:"count"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Count != maxFullLimit || !body.Truncated {
+		t.Fatalf("count=%d truncated=%v, want %d/true", body.Count, body.Truncated, maxFullLimit)
 	}
 }

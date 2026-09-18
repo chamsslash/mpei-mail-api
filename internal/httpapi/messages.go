@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -72,7 +73,58 @@ func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
 		msgs = []mail.Message{}
 	}
 
+	if r.URL.Query().Get("full") == "true" {
+		a.writeFullList(w, r, q.Mailbox, msgs)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs, "count": len(msgs)})
+}
+
+// maxFullLimit ограничивает ?full=true отдельно от limit. Причина в цене: в
+// листинге тел писем нет, и каждое приходится забирать отдельным походом в
+// почтовый сервер на 2–4 секунды. Полсотни — это уже около трёх минут в одном
+// HTTP-запросе; больше отдавать одним куском бессмысленно, клиент отвалится по
+// таймауту раньше.
+const maxFullLimit = 50
+
+// writeFullList дозагружает тела к уже полученному листингу. Живёт в HTTP-слое,
+// а не в Source, намеренно: это склейка двух существующих операций, одинаковая
+// для любого источника, и добавлять её в интерфейс значило бы дублировать
+// реализацию в imapsrc и owasrc.
+func (a *api) writeFullList(w http.ResponseWriter, r *http.Request, mailbox string, msgs []mail.Message) {
+	truncated := false
+	if len(msgs) > maxFullLimit {
+		msgs, truncated = msgs[:maxFullLimit], true
+	}
+
+	out := make([]*mail.MessageFull, 0, len(msgs))
+	failed := 0
+	for _, m := range msgs {
+		// Клиент мог отвалиться или истечь по таймауту: продолжать ходить в
+		// почтовый сервер за письмами, которые никто не прочитает, незачем.
+		if err := r.Context().Err(); err != nil {
+			writeErr(w, http.StatusGatewayTimeout, "upstream_timeout", "выборка не уложилась в таймаут запроса")
+			return
+		}
+
+		full, err := a.src.Get(r.Context(), mailbox, m.UID)
+		if err != nil || full == nil {
+			// Одно нечитаемое письмо не должно рушить всю историю: пропускаем
+			// его и сообщаем счётчиком, сколько потерялось.
+			slog.Warn("не удалось забрать тело письма", "mailbox", mailbox, "uid", m.UID, "err", err)
+			failed++
+			continue
+		}
+		out = append(out, full)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"messages":  out,
+		"count":     len(out),
+		"failed":    failed,
+		"truncated": truncated,
+	})
 }
 
 func (a *api) handleGet(w http.ResponseWriter, r *http.Request) {
