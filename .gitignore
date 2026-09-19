@@ -1,2 +1,8 @@
 .env
 /mpei-mail-api
+
+# Рабочие файлы дайджеста: секреты и промежуточное состояние одного прогона
+digest/.env
+digest/pending.json
+digest/summary.txt
+digest/*.tmp
