@@ -21,9 +21,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 PENDING = HERE / "pending.json"
+
+# Облачный запуск живёт по UTC, а сводку читает человек в Москве: без явной
+# зоны время в шапке отставало бы на три часа.
+DEFAULT_TZ = "Europe/Moscow"
 
 DEFAULT_BASE = "https://gyattalert-mpei.duckdns.org"
 TIMEOUT = 180  # full=true тянет тела всех писем разом, это небыстро
@@ -70,6 +75,14 @@ def write_json(path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(path)  # атомарно: файл не побьётся при падении посреди записи
+
+
+def now_local():
+    try:
+        return datetime.now(ZoneInfo(os.environ.get("DIGEST_TZ", DEFAULT_TZ)))
+    except Exception:
+        # Кривая зона не повод терять сводку — уходим на UTC.
+        return datetime.now()
 
 
 def batch_limit():
@@ -226,7 +239,7 @@ def cmd_send(summary_path):
         die("сводка пустая — письма не помечены, уйдут в следующий раз")
 
     uids, failed = pending["uids"], pending.get("failed", 0)
-    header = f"📬 Почта МЭИ · новых: {len(uids)} · {datetime.now():%d.%m %H:%M}\n\n"
+    header = f"📬 Почта МЭИ · новых: {len(uids)} · {now_local():%d.%m %H:%M}\n\n"
     footer = f"\n\n❗ Не удалось прочитать писем: {failed}" if failed else ""
 
     try:
