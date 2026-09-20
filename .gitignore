@@ -6,3 +6,5 @@ digest/.env
 digest/pending.json
 digest/summary.txt
 digest/*.tmp
+tgbridge/offset.json
+tgbridge/*.tmp
