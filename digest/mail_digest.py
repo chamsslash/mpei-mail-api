@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -81,8 +81,11 @@ def now_local():
     try:
         return datetime.now(ZoneInfo(os.environ.get("DIGEST_TZ", DEFAULT_TZ)))
     except Exception:
-        # Кривая зона не повод терять сводку — уходим на UTC.
-        return datetime.now()
+        # Базы зон в образе может не оказаться (zoneinfo читает её из системы,
+        # а в урезанных контейнерах /usr/share/zoneinfo пустой). Запасной
+        # вариант — фиксированный +03:00: Москва живёт без перехода на летнее
+        # время с 2014 года, так что для дефолта смещение постоянное.
+        return datetime.now(timezone(timedelta(hours=3)))
 
 
 def batch_limit():
